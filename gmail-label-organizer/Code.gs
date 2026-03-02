@@ -540,6 +540,91 @@ function removeAllCreatedLabels() {
 }
 
 // ============================================================
+// LABEL COLORS — Requires Gmail Advanced Service
+// ============================================================
+// To enable: In the script editor, click + next to "Services",
+// select "Gmail API", and click "Add".
+
+// Color per parent category — { backgroundColor, textColor }
+const LABEL_COLORS = {
+  'Jobs':         { bg: '#1a764d', text: '#ffffff' },  // dark green
+  'Finance':      { bg: '#076239', text: '#ffffff' },  // forest green
+  'Dev':          { bg: '#4986e7', text: '#ffffff' },  // blue
+  'Google':       { bg: '#2da2bb', text: '#ffffff' },  // teal
+  'Shopping':     { bg: '#ffad46', text: '#ffffff' },  // orange
+  'Social':       { bg: '#f691b2', text: '#ffffff' },  // pink
+  'Lodge':        { bg: '#653e9b', text: '#ffffff' },  // purple
+  'Government':   { bg: '#cc3a21', text: '#ffffff' },  // red
+  'Services':     { bg: '#cf8933', text: '#ffffff' },  // dark orange
+  'Education':    { bg: '#16a765', text: '#ffffff' },  // green
+  'Newsletters':  { bg: '#a479e2', text: '#ffffff' },  // light purple
+  'Real Estate':  { bg: '#aa8831', text: '#ffffff' },  // gold
+  'File Sharing': { bg: '#999999', text: '#ffffff' },  // gray
+  'Domains':      { bg: '#6d9eeb', text: '#ffffff' },  // light blue
+  'Parking':      { bg: '#666666', text: '#ffffff' },  // dark gray
+  'Personal':     { bg: '#fb4c2f', text: '#ffffff' },  // bright red
+  'Suppliers':    { bg: '#822111', text: '#ffffff' },  // dark red
+  'Uncategorized':{ bg: '#cccccc', text: '#000000' },  // light gray
+};
+
+/**
+ * Applies colors to all labels managed by this script.
+ *
+ * PREREQUISITE: Enable Gmail Advanced Service first:
+ *   Script editor → Services (+) → Gmail API → Add
+ *
+ * Run this once after createLabelsAndApply().
+ */
+function colorizeLabels() {
+  // Get all Gmail labels
+  var response = Gmail.Users.Labels.list('me');
+  var gmailLabels = {};
+  for (var i = 0; i < response.labels.length; i++) {
+    gmailLabels[response.labels[i].name] = response.labels[i].id;
+  }
+
+  var colored = 0;
+
+  // Color all labels from LABEL_MAP
+  var allLabelNames = Object.keys(LABEL_MAP);
+
+  // Also include parent-only labels
+  var parents = new Set();
+  for (var j = 0; j < allLabelNames.length; j++) {
+    if (allLabelNames[j].includes('/')) {
+      parents.add(allLabelNames[j].split('/')[0]);
+    }
+  }
+  parents.forEach(function(p) { allLabelNames.push(p); });
+
+  // Add standalone labels (like "Personal" which has no slash)
+  for (var k = 0; k < allLabelNames.length; k++) {
+    var labelName = allLabelNames[k];
+    var parentCategory = labelName.includes('/') ? labelName.split('/')[0] : labelName;
+    var colorConfig = LABEL_COLORS[parentCategory];
+
+    if (!colorConfig) continue;
+
+    var labelId = gmailLabels[labelName];
+    if (!labelId) continue;
+
+    try {
+      Gmail.Users.Labels.update(
+        { color: { backgroundColor: colorConfig.bg, textColor: colorConfig.text } },
+        'me',
+        labelId
+      );
+      colored++;
+      Logger.log('  🎨 ' + labelName + ' → ' + parentCategory + ' color');
+    } catch (err) {
+      Logger.log('  Error coloring ' + labelName + ': ' + err.message);
+    }
+  }
+
+  Logger.log('\n✅ Colored ' + colored + ' labels.');
+}
+
+// ============================================================
 // SMART CATEGORIZATION — Auto-discover & categorize unknown senders
 // ============================================================
 
