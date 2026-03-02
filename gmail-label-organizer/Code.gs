@@ -538,3 +538,595 @@ function removeAllCreatedLabels() {
 
   Logger.log("All labels removed.");
 }
+
+// ============================================================
+// SMART CATEGORIZATION — Auto-discover & categorize unknown senders
+// ============================================================
+
+// --- Heuristic Rule Tables ---
+
+// TLD rules — more specific entries first (checked top-to-bottom)
+const SMART_TLD_RULES = [
+  ['gc.ca', 'Government/Canada'],
+  ['gov.ca', 'Government/Canada'],
+  ['gov.ua', 'Government/Ukraine'],
+  ['mil.ua', 'Government/Ukraine'],
+  ['gov.il', 'Government/Israel'],
+  ['ac.il', 'Education/Other'],
+  ['edu.il', 'Education/Other'],
+  ['edu.ua', 'Education/Other'],
+  ['edu.ca', 'Education/Other'],
+  ['edu', 'Education/Other'],
+  ['gov', 'Government/Other'],
+  ['mil', 'Government/Other'],
+];
+
+// Domain keywords → suggested label (matched against sender's domain)
+const SMART_DOMAIN_KEYWORDS = {
+  'bank': 'Finance/Other',
+  'financ': 'Finance/Other',
+  'invest': 'Finance/Other',
+  'insur': 'Finance/Other',
+  'credit': 'Finance/Other',
+  'mortgage': 'Finance/Other',
+  'payment': 'Finance/Other',
+  'shop': 'Shopping/Other',
+  'store': 'Shopping/Other',
+  'retail': 'Shopping/Other',
+  'market': 'Shopping/Other',
+  'job': 'Jobs/Other',
+  'career': 'Jobs/Other',
+  'recruit': 'Jobs/Other',
+  'hiring': 'Jobs/Other',
+  'travel': 'Services/Other',
+  'hotel': 'Services/Other',
+  'flight': 'Services/Other',
+  'booking': 'Services/Other',
+  'realt': 'Real Estate/Other',
+  'property': 'Real Estate/Other',
+  'newsletter': 'Newsletters/Other',
+};
+
+// Sender display-name keywords → suggested label
+const SMART_NAME_KEYWORDS = {
+  'bank': 'Finance/Other',
+  'financial': 'Finance/Other',
+  'payment': 'Finance/Other',
+  'invoice': 'Finance/Other',
+  'receipt': 'Shopping/Other',
+  'order confirm': 'Shopping/Other',
+  'shipping': 'Shopping/Other',
+  'coupon': 'Shopping/Other',
+  'discount': 'Shopping/Other',
+  'promo': 'Shopping/Other',
+  'newsletter': 'Newsletters/Other',
+  'digest': 'Newsletters/Other',
+  'weekly update': 'Newsletters/Other',
+  'job alert': 'Jobs/Other',
+  'career': 'Jobs/Other',
+  'security alert': 'Services/Other',
+};
+
+// Gmail category → fallback label
+const SMART_GMAIL_CATEGORY_MAP = {
+  'PROMOTIONS': 'Shopping/Other',
+  'SOCIAL': 'Social/Other',
+  'UPDATES': 'Services/Other',
+  'FORUMS': 'Newsletters/Other',
+};
+
+// --- Helper Functions ---
+
+/**
+ * Builds a Set of all known sender emails/domains from LABEL_MAP for O(1) lookup.
+ */
+function buildKnownSenderSet() {
+  const set = new Set();
+  for (const senders of Object.values(LABEL_MAP)) {
+    for (const sender of senders) {
+      set.add(sender.toLowerCase());
+    }
+  }
+  return set;
+}
+
+/**
+ * Extracts the registrable base domain from a full domain.
+ * Handles country-code SLDs like .co.il, .com.ua, .ac.uk.
+ */
+function getBaseDomain(fullDomain) {
+  const parts = fullDomain.split('.');
+  if (parts.length <= 2) return fullDomain;
+
+  const secondLevel = parts[parts.length - 2];
+  const countrySLDs = ['co', 'com', 'org', 'net', 'gov', 'ac', 'edu', 'or', 'ne'];
+
+  if (countrySLDs.includes(secondLevel) && parts.length > 2) {
+    return parts.slice(-3).join('.');
+  }
+  return parts.slice(-2).join('.');
+}
+
+/**
+ * Maps domains from LABEL_MAP to their most common label.
+ * Also maps base domains (e.g., m.wealthsimple.com → wealthsimple.com).
+ */
+function buildDomainToLabelMap() {
+  const domainCounts = {}; // domain → { label → senderCount }
+
+  for (const [label, senders] of Object.entries(LABEL_MAP)) {
+    for (const sender of senders) {
+      const atIndex = sender.lastIndexOf('@');
+      if (atIndex === -1) continue;
+      const fullDomain = sender.substring(atIndex + 1).toLowerCase();
+
+      // Map the full subdomain
+      if (!domainCounts[fullDomain]) domainCounts[fullDomain] = {};
+      domainCounts[fullDomain][label] = (domainCounts[fullDomain][label] || 0) + 1;
+
+      // Also map the base domain
+      const base = getBaseDomain(fullDomain);
+      if (base !== fullDomain) {
+        if (!domainCounts[base]) domainCounts[base] = {};
+        domainCounts[base][label] = (domainCounts[base][label] || 0) + 1;
+      }
+    }
+  }
+
+  // For each domain, pick the label with the most senders
+  const result = {};
+  for (const [domain, labels] of Object.entries(domainCounts)) {
+    let best = '', bestCount = 0;
+    for (const [label, count] of Object.entries(labels)) {
+      if (count > bestCount) { bestCount = count; best = label; }
+    }
+    result[domain] = best;
+  }
+  return result;
+}
+
+/**
+ * Extracts email address, display name, and domain from a GmailMessage.
+ */
+function parseSender(message) {
+  const from = message.getFrom();
+  if (!from) return null;
+
+  const angleMatch = from.match(/<([^>]+)>/);
+  const email = (angleMatch ? angleMatch[1] : from).trim().toLowerCase();
+
+  if (!email.includes('@')) return null;
+
+  const name = from.replace(/<[^>]+>/, '').replace(/"/g, '').trim();
+  const domain = email.split('@')[1];
+
+  return { email: email, name: name, domain: domain };
+}
+
+/**
+ * Detects which Gmail category a sender's messages fall into.
+ * Searches category:promotions/social/updates/forums. Returns 'PRIMARY' if none match.
+ */
+function detectGmailCategory(email) {
+  const categories = ['promotions', 'social', 'updates', 'forums'];
+  for (const cat of categories) {
+    try {
+      const threads = GmailApp.search('from:' + email + ' category:' + cat, 0, 1);
+      if (threads.length > 0) return cat.toUpperCase();
+    } catch (e) { /* skip */ }
+  }
+  return 'PRIMARY';
+}
+
+/**
+ * Pure heuristic engine — returns { label, confidence } for a sender.
+ *
+ * Priority order:
+ *   1. Domain affinity (exact or parent domain in LABEL_MAP)  → High
+ *   2. TLD rules (.gov, .edu, etc.)                           → High
+ *   3. Domain keywords (bank, shop, job, etc.)                 → Medium
+ *   4. Sender name keywords                                    → Medium
+ *   5. Gmail category fallback                                 → Low
+ *   6. Default → Uncategorized                                 → Low
+ */
+function categorizeSender(email, name, domain, gmailCategory, domainToLabel) {
+  // Priority 1: Domain affinity — exact domain match
+  if (domainToLabel[domain]) {
+    return { label: domainToLabel[domain], confidence: 'High' };
+  }
+  // Walk up the domain hierarchy (e.g., sub.example.com → example.com)
+  const parts = domain.split('.');
+  for (let i = 1; i < parts.length - 1; i++) {
+    const parent = parts.slice(i).join('.');
+    if (domainToLabel[parent]) {
+      return { label: domainToLabel[parent], confidence: 'High' };
+    }
+  }
+
+  // Priority 2: TLD rules
+  for (const [tld, label] of SMART_TLD_RULES) {
+    if (domain === tld || domain.endsWith('.' + tld)) {
+      return { label: label, confidence: 'High' };
+    }
+  }
+
+  // Priority 3: Domain keywords
+  for (const [keyword, label] of Object.entries(SMART_DOMAIN_KEYWORDS)) {
+    if (domain.includes(keyword)) {
+      return { label: label, confidence: 'Medium' };
+    }
+  }
+
+  // Priority 4: Sender name keywords
+  const lowerName = (name || '').toLowerCase();
+  if (lowerName) {
+    for (const [keyword, label] of Object.entries(SMART_NAME_KEYWORDS)) {
+      if (lowerName.includes(keyword)) {
+        return { label: label, confidence: 'Medium' };
+      }
+    }
+  }
+
+  // Priority 5: Gmail category fallback
+  if (gmailCategory && SMART_GMAIL_CATEGORY_MAP[gmailCategory]) {
+    return { label: SMART_GMAIL_CATEGORY_MAP[gmailCategory], confidence: 'Low' };
+  }
+
+  // Priority 6: Default
+  return { label: 'Uncategorized', confidence: 'Low' };
+}
+
+// --- Google Sheet Dashboard ---
+
+/**
+ * Creates or retrieves the dashboard Google Sheet.
+ * Sets up headers, column widths, Status dropdown, and conditional formatting.
+ */
+function getOrCreateDashboard() {
+  const props = PropertiesService.getScriptProperties();
+  const sheetId = props.getProperty('dashboardSheetId');
+
+  // Try to open existing sheet
+  if (sheetId) {
+    try {
+      const ss = SpreadsheetApp.openById(sheetId);
+      const sheet = ss.getSheetByName('Dashboard');
+      if (sheet) return { sheet: sheet, spreadsheet: ss };
+    } catch (e) { /* deleted or no access — recreate */ }
+  }
+
+  // Create new spreadsheet
+  const ss = SpreadsheetApp.create('Gmail Smart Label Organizer');
+  const sheet = ss.getActiveSheet();
+  sheet.setName('Dashboard');
+
+  // Headers
+  const headers = [
+    'Sender Email', 'Sender Name', 'Domain', 'Count',
+    'Gmail Category', 'Suggested Label', 'Confidence',
+    'Status', 'Approved Label', 'Date Added'
+  ];
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  sheet.getRange(1, 1, 1, headers.length)
+    .setFontWeight('bold')
+    .setBackground('#4a86c8')
+    .setFontColor('#ffffff');
+
+  // Column widths
+  var widths = [250, 200, 150, 60, 120, 200, 100, 100, 200, 100];
+  for (var w = 0; w < widths.length; w++) {
+    sheet.setColumnWidth(w + 1, widths[w]);
+  }
+
+  // Data validation for Status column (dropdown)
+  var statusRule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(['Pending', 'Approved', 'Rejected', 'Applied'])
+    .setAllowInvalid(false)
+    .build();
+  sheet.getRange('H2:H1000').setDataValidation(statusRule);
+
+  // Conditional formatting for Status column
+  var statusRange = sheet.getRange('H2:H1000');
+  var rules = [
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenTextEqualTo('Pending').setBackground('#fff2cc')
+      .setRanges([statusRange]).build(),
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenTextEqualTo('Approved').setBackground('#d9ead3')
+      .setRanges([statusRange]).build(),
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenTextEqualTo('Rejected').setBackground('#f4cccc')
+      .setRanges([statusRange]).build(),
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenTextEqualTo('Applied').setBackground('#cfe2f3')
+      .setRanges([statusRange]).build(),
+  ];
+  sheet.setConditionalFormatRules(rules);
+
+  // Freeze header row
+  sheet.setFrozenRows(1);
+
+  // Persist sheet ID
+  props.setProperty('dashboardSheetId', ss.getId());
+
+  Logger.log('Created dashboard: ' + ss.getUrl());
+  return { sheet: sheet, spreadsheet: ss };
+}
+
+// --- Main Entry Points ---
+
+/**
+ * Main discovery function — scans inbox for unknown senders, categorizes them
+ * using domain heuristics, and writes results to a Google Sheet dashboard.
+ *
+ * Resumable: saves page offset in PropertiesService. Run repeatedly until
+ * the log shows "DISCOVERY COMPLETE".
+ */
+function discoverAndCategorizeSenders() {
+  var startTime = Date.now();
+  var props = PropertiesService.getScriptProperties();
+
+  Logger.log('=== Smart Sender Discovery ===');
+
+  // Build lookup structures
+  var knownSenders = buildKnownSenderSet();
+  var domainToLabel = buildDomainToLabelMap();
+
+  // Get or create dashboard
+  var dashboard = getOrCreateDashboard();
+  var sheet = dashboard.sheet;
+  var spreadsheet = dashboard.spreadsheet;
+  Logger.log('Dashboard: ' + spreadsheet.getUrl());
+
+  // Load existing emails from sheet to skip duplicates
+  var existingEmails = new Set();
+  var lastRow = sheet.getLastRow();
+  if (lastRow > 1) {
+    var emailCol = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+    for (var e = 0; e < emailCol.length; e++) {
+      if (emailCol[e][0]) existingEmails.add(emailCol[e][0].toString().toLowerCase());
+    }
+  }
+
+  // Resume from saved progress
+  var pageOffset = parseInt(props.getProperty('discoverPageOffset') || '0');
+  var pageSize = 100;
+  var newSendersCount = 0;
+  var seenThisRun = new Set();
+  var rowBuffer = [];
+  var today = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+
+  Logger.log('Scanning inbox from offset ' + pageOffset + '...\n');
+
+  while (true) {
+    // Time check before fetching next page
+    if (Date.now() - startTime > MAX_RUNTIME_MS) {
+      if (rowBuffer.length > 0) {
+        var flushStart = sheet.getLastRow() + 1;
+        sheet.getRange(flushStart, 1, rowBuffer.length, 10).setValues(rowBuffer);
+        rowBuffer = [];
+      }
+      props.setProperty('discoverPageOffset', pageOffset.toString());
+      Logger.log('\n⏱ Time limit reached. Found ' + newSendersCount + ' new senders this run.');
+      Logger.log('➡ Run again to continue from offset ' + pageOffset + '.');
+      return;
+    }
+
+    var threads;
+    try {
+      threads = GmailApp.search('in:inbox', pageOffset, pageSize);
+    } catch (err) {
+      Logger.log('Search error at offset ' + pageOffset + ': ' + err.message);
+      // Preserve progress on error instead of falling through to deleteProperty
+      if (rowBuffer.length > 0) {
+        var errFlush = sheet.getLastRow() + 1;
+        sheet.getRange(errFlush, 1, rowBuffer.length, 10).setValues(rowBuffer);
+      }
+      props.setProperty('discoverPageOffset', pageOffset.toString());
+      Logger.log('Progress saved. Run again to retry from offset ' + pageOffset + '.');
+      return;
+    }
+
+    if (threads.length === 0) break; // No more threads — scan complete
+
+    for (var t = 0; t < threads.length; t++) {
+      var messages;
+      try { messages = threads[t].getMessages(); } catch (err2) { continue; }
+      if (!messages || messages.length === 0) continue;
+
+      var sender = parseSender(messages[0]);
+      if (!sender) continue;
+
+      // Skip: already known, already in sheet, or already seen this run
+      if (knownSenders.has(sender.email) || knownSenders.has(sender.domain) ||
+          existingEmails.has(sender.email) || seenThisRun.has(sender.email)) continue;
+
+      seenThisRun.add(sender.email);
+
+      // Safety margin — stop 90s early to account for up to 5 GmailApp.search() calls per sender
+      if (Date.now() - startTime > MAX_RUNTIME_MS - 90000) {
+        if (rowBuffer.length > 0) {
+          var earlyFlush = sheet.getLastRow() + 1;
+          sheet.getRange(earlyFlush, 1, rowBuffer.length, 10).setValues(rowBuffer);
+          rowBuffer = [];
+        }
+        props.setProperty('discoverPageOffset', pageOffset.toString());
+        Logger.log('\n⏱ Time limit approaching. Found ' + newSendersCount + ' new senders this run.');
+        Logger.log('➡ Run again to continue from offset ' + pageOffset + '.');
+        return;
+      }
+
+      // Count total threads from this sender
+      var count = 1;
+      try {
+        count = GmailApp.search('from:' + sender.email, 0, 500).length;
+      } catch (err3) { /* keep count = 1 */ }
+
+      // Detect Gmail category
+      var gmailCategory = detectGmailCategory(sender.email);
+
+      // Categorize using heuristic engine
+      var result = categorizeSender(sender.email, sender.name, sender.domain, gmailCategory, domainToLabel);
+
+      rowBuffer.push([
+        sender.email, sender.name, sender.domain, count,
+        gmailCategory, result.label, result.confidence,
+        'Pending', '', today
+      ]);
+      newSendersCount++;
+      existingEmails.add(sender.email);
+
+      Logger.log('  ' + sender.email + ' → ' + result.label + ' (' + result.confidence + ')');
+
+      // Flush buffer every 20 senders for safety
+      if (rowBuffer.length >= 20) {
+        var batchStart = sheet.getLastRow() + 1;
+        sheet.getRange(batchStart, 1, rowBuffer.length, 10).setValues(rowBuffer);
+        rowBuffer = [];
+      }
+    }
+
+    pageOffset += threads.length;
+  }
+
+  // Flush remaining buffer
+  if (rowBuffer.length > 0) {
+    var finalFlush = sheet.getLastRow() + 1;
+    sheet.getRange(finalFlush, 1, rowBuffer.length, 10).setValues(rowBuffer);
+  }
+
+  // Sort all data rows by Count (column 4) descending
+  var finalLastRow = sheet.getLastRow();
+  if (finalLastRow > 1) {
+    sheet.getRange(2, 1, finalLastRow - 1, 10).sort({ column: 4, ascending: false });
+  }
+
+  // Clear saved progress
+  props.deleteProperty('discoverPageOffset');
+  Logger.log('\n✅ DISCOVERY COMPLETE. Found ' + newSendersCount + ' new senders.');
+  Logger.log('Review suggestions at: ' + spreadsheet.getUrl());
+}
+
+/**
+ * Reads "Approved" rows from the dashboard, creates labels, and applies them
+ * to matching Gmail threads. Updates status to "Applied" when done.
+ *
+ * Resumable: run repeatedly until the log shows "ALL APPROVED PROCESSED".
+ */
+function applyApprovedLabels() {
+  var startTime = Date.now();
+
+  Logger.log('=== Applying Approved Labels ===');
+
+  var dashboard = getOrCreateDashboard();
+  var sheet = dashboard.sheet;
+  var lastRow = sheet.getLastRow();
+  if (lastRow <= 1) {
+    Logger.log('No senders in dashboard.');
+    return;
+  }
+
+  var data = sheet.getRange(2, 1, lastRow - 1, 10).getValues();
+  var applied = 0;
+  var skipped = 0;
+
+  for (var i = 0; i < data.length; i++) {
+    if (Date.now() - startTime > MAX_RUNTIME_MS) {
+      Logger.log('\n⏱ Time limit. Applied ' + applied + ' labels so far.');
+      Logger.log('➡ Run again to continue.');
+      return;
+    }
+
+    var status = data[i][7];
+    if (status !== 'Approved') {
+      if (status === 'Pending') skipped++;
+      continue;
+    }
+
+    var email = data[i][0];
+    var approvedLabel = (data[i][8] || '').toString().trim();
+    var suggestedLabel = (data[i][5] || '').toString().trim();
+    var labelName = approvedLabel || suggestedLabel;
+
+    if (!labelName || labelName === 'Uncategorized') {
+      Logger.log('  Skipping ' + email + ': no valid label');
+      continue;
+    }
+
+    // Create label (and parent) if needed
+    createLabelIfNotExists(labelName);
+    var label = GmailApp.getUserLabelByName(labelName);
+    if (!label) {
+      Logger.log('  Failed to create/get label: ' + labelName);
+      continue;
+    }
+
+    // Apply label to all threads from this sender
+    try {
+      var threads = GmailApp.search('from:' + email, 0, 500);
+      if (threads.length > 0) {
+        for (var j = 0; j < threads.length; j += 100) {
+          label.addToThreads(threads.slice(j, j + 100));
+        }
+        Logger.log('  ' + labelName + ' ← ' + email + ' (' + threads.length + ' threads)');
+      }
+    } catch (err) {
+      Logger.log('  Error for ' + email + ': ' + err.message);
+      continue;
+    }
+
+    // Update status in sheet
+    sheet.getRange(i + 2, 8).setValue('Applied');
+    applied++;
+  }
+
+  Logger.log('\n✅ ALL APPROVED PROCESSED.');
+  Logger.log('Applied: ' + applied + ', Still pending: ' + skipped);
+}
+
+// --- Utility Functions ---
+
+/**
+ * Clears discovery progress so the next run scans from the beginning.
+ * The dashboard sheet and its data are preserved.
+ */
+function resetDiscoveryProgress() {
+  var props = PropertiesService.getScriptProperties();
+  props.deleteProperty('discoverPageOffset');
+  Logger.log('Discovery progress reset. Next run starts from the beginning.');
+  Logger.log('Note: Dashboard sheet and its data are preserved.');
+}
+
+/**
+ * Optional: Sets up automatic triggers for discovery and label application.
+ *   - Discovery: weekly on Sunday at 2 AM
+ *   - Apply approved: daily at 3 AM
+ */
+function setupSmartTriggers() {
+  // Remove existing smart triggers
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    var fn = triggers[i].getHandlerFunction();
+    if (fn === 'discoverAndCategorizeSenders' || fn === 'applyApprovedLabels') {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+
+  // Weekly discovery (Sundays at 2 AM)
+  ScriptApp.newTrigger('discoverAndCategorizeSenders')
+    .timeBased()
+    .onWeekDay(ScriptApp.WeekDay.SUNDAY)
+    .atHour(2)
+    .create();
+
+  // Daily apply (every day at 3 AM)
+  ScriptApp.newTrigger('applyApprovedLabels')
+    .timeBased()
+    .everyDays(1)
+    .atHour(3)
+    .create();
+
+  Logger.log('Smart triggers configured:');
+  Logger.log('  - Discovery: weekly on Sunday at 2 AM');
+  Logger.log('  - Apply approved: daily at 3 AM');
+}

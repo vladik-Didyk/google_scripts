@@ -130,6 +130,65 @@ The `LABEL_MAP` was not created manually from scratch — it was generated with 
 - It only labels emails from the **149 senders** that were found during the initial scan
 - New senders must be manually added to `LABEL_MAP` (see [Customization](#customization))
 
+## Smart Categorization (Auto-Discovery)
+
+The static `LABEL_MAP` covers known senders, but new senders are ignored. The **Smart Categorization** feature auto-discovers unknown senders, suggests labels using domain heuristics, and lets you review everything in a Google Sheet before applying.
+
+### How It Works
+
+1. **Scans your inbox** for senders not in `LABEL_MAP`
+2. **Categorizes each sender** using a priority-ordered heuristic engine:
+
+| Priority | Rule | Confidence | Example |
+|----------|------|------------|---------|
+| 1 | Domain affinity — sender's domain matches one in LABEL_MAP | High | `news@github.com` → `Dev/GitHub` |
+| 2 | TLD rules — `.gov.ca` → Government/Canada, `.edu` → Education | High | `info@uoft.edu` → `Education/Other` |
+| 3 | Domain keywords — domain contains "bank", "shop", "job", etc. | Medium | `promo@bestbuyshop.com` → `Shopping/Other` |
+| 4 | Sender name keywords — display name contains category keywords | Medium | `"PayPal Security" <x@y.com>` → `Finance/Other` |
+| 5 | Gmail category fallback — uses `category:promotions` search | Low | PROMOTIONS → `Shopping/Other` |
+| 6 | Default | Low | → `Uncategorized` |
+
+3. **Writes results to a Google Sheet** with columns: Sender Email, Sender Name, Domain, Count, Gmail Category, Suggested Label, Confidence, Status, Approved Label, Date Added
+4. You **review and approve/reject** in the Sheet, then run the apply function
+
+### Google Sheet Dashboard
+
+The dashboard is auto-created on first run. Key features:
+
+- **Status dropdown**: Pending (yellow), Approved (green), Rejected (red), Applied (blue)
+- **Approved Label column**: override the suggestion with a custom label
+- **Sorted by message count** (highest-traffic senders first)
+- **Conditional formatting** for quick visual scanning
+
+### Workflow
+
+```
+1. Run discoverAndCategorizeSenders()    → repeat until "DISCOVERY COMPLETE"
+   (the Sheet URL is printed in the execution log)
+
+2. Open Sheet → review suggestions → set Status = "Approved" or "Rejected"
+   (optionally type a custom label in the "Approved Label" column)
+
+3. Run applyApprovedLabels()             → repeat until "ALL APPROVED PROCESSED"
+```
+
+### Smart Categorization Functions
+
+| Function | How to Use | Description |
+|----------|-----------|-------------|
+| `discoverAndCategorizeSenders` | **Run this first** | Scans inbox for unknown senders, categorizes them, writes to Google Sheet. Resumable. |
+| `applyApprovedLabels` | Run after reviewing Sheet | Creates labels and applies them to Gmail threads for "Approved" rows. Resumable. |
+| `resetDiscoveryProgress` | Run if needed | Clears scan progress (Sheet data is preserved). |
+| `setupSmartTriggers` | Run once (optional) | Weekly discovery (Sunday 2 AM) + daily apply (3 AM). |
+
+### Notes
+
+- **No external APIs** — pure domain heuristic rules, no API keys needed
+- **New OAuth scope** — `spreadsheets` is required (you'll re-authorize on first run)
+- **Resumable** — same 5-minute safety cutoff as the original functions
+- **Idempotent** — skips senders already in the Sheet or LABEL_MAP
+- **Non-destructive** — zero modifications to existing `LABEL_MAP` or functions
+
 ## Troubleshooting
 
 | Issue | Solution |
