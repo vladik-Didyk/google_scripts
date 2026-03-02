@@ -104,6 +104,17 @@ Nested labels use `/` as a separator. `"Travel/Airbnb"` creates a parent label *
 
 ## How It Works
 
+### How the Label Map Was Generated
+
+The `LABEL_MAP` was not created manually from scratch — it was generated with the help of Claude Code:
+
+1. **Inbox Scan** — Used the Gmail MCP connection to fetch the 500 most recent messages and extract `From` headers from each one.
+2. **Sender Analysis** — Ran a Python script to count messages per sender, finding **149 unique senders**.
+3. **Categorization** — Senders were grouped into logical categories based on their names and domains (e.g., `@linkedin.com` → Jobs, `@github.com` → Dev, `@costco.ca` → Shopping).
+4. **Hardcoded Map** — The result became the static `LABEL_MAP` dictionary in the script.
+
+### What the Script Does at Runtime
+
 1. **Label Creation** — Iterates through `LABEL_MAP` keys. For nested labels like `"Jobs/LinkedIn"`, creates the parent `"Jobs"` first, then the child. Skips labels that already exist.
 
 2. **Message Labeling** — For each sender email, runs a Gmail search (`from:sender@example.com`), retrieves up to 500 matching threads, and applies the corresponding label in batches of 100.
@@ -111,6 +122,13 @@ Nested labels use `/` as a separator. `"Travel/Airbnb"` creates a parent label *
 3. **Progress Tracking** — Uses `PropertiesService.getScriptProperties()` to persist the current label index, sender index, and total threads labeled across executions.
 
 4. **Auto-labeling** (optional) — A time-based trigger runs `labelRecentMessages()` every 6 hours, searching only for messages from the last 24 hours.
+
+### Limitations
+
+- The script does **not** use AI or content analysis at runtime
+- It does **not** auto-detect new senders
+- It only labels emails from the **149 senders** that were found during the initial scan
+- New senders must be manually added to `LABEL_MAP` (see [Customization](#customization))
 
 ## Troubleshooting
 
